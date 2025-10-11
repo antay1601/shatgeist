@@ -1,0 +1,14 @@
+[project]
+name = "chatgeist"
+version = "0.3.0" # Снова повышаем версию, так как меняем ключевой фреймворк
+description = "Агент-аналитик для истории Telegram-чата на основе LangChain и SQL."
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "langchain",            # Основной фреймворк
+    "langchain-anthropic",  # <-- Новая библиотека для Claude
+    "langchain-community",    # Содержит полезные утилиты, включая SQL-агента
+    "python-dotenv",
+    "aiogram"
+]

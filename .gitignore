@@ -1,0 +1,31 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Secrets and local configurations
+.env
+*.env
+
+# Database and index files
+qa.db
+qa.index
+
+# Large data files
+chat_history.json
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Log files
+log.md
+*.log
+chatgueist-aaa91d575472.json
