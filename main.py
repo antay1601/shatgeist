@@ -24,39 +24,58 @@ load_dotenv()
 DB_FILE = 'qa.db'
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-LOG_FILE = "log.md"
+LOG_FILE = "llm_requests.log"
 
 if not ANTHROPIC_API_KEY or not TELEGRAM_BOT_TOKEN:
     raise ValueError("Необходимо установить ANTHROPIC_API_KEY и TELEGRAM_BOT_TOKEN в .env файле")
 
 # ... (Класс FileCallbackHandler остается без изменений) ...
 class FileCallbackHandler(BaseCallbackHandler):
+    """Логирует полный цикл работы агента, уделяя особое внимание запросам к LLM."""
     def __init__(self, filename: str = LOG_FILE):
         self.file = open(filename, 'a', encoding='utf-8')
+
     def on_chain_start(self, serialized: dict, inputs: dict, **kwargs) -> None:
-        self.file.write(f"\n\n---\n\n## Новая сессия: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        self.file.write(f"\n\n---\n\n## 🚀 Новая сессия: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         user_input = "Не удалось определить входной запрос"
         if isinstance(inputs, dict):
             user_input = inputs.get('input', user_input)
-        self.file.write(f"**Входной запрос:**\n```\n{user_input}\n```\n")
-    def on_agent_action(self, action: AgentAction, **kwargs) -> None:
-        self.file.write(f"### Шаг: Использование инструмента\n\n")
-        self.file.write(f"**Инструмент:** `{action.tool}`\n")
-        self.file.write(f"**SQL-запрос:**\n```sql\n{action.tool_input}\n```\n")
-    def on_tool_end(self, output: str, **kwargs) -> None:
-        self.file.write(f"**Полученные данные из БД:**\n```\n{output}\n```\n")
+        self.file.write(f"**Входной запрос пользователя:**\n```\n{user_input}\n```\n")
+        self.file.flush()
+
+    def on_llm_start(self, serialized: dict, prompts: list[str], **kwargs) -> None:
+        self.file.write(f"\n### ➡️ Запрос к LLM\n\n")
+        for i, prompt in enumerate(prompts):
+            self.file.write(f"**Промпт {i+1}:**\n```text\n{prompt}\n```\n")
+        self.file.flush()
+
     def on_llm_end(self, response: LLMResult, **kwargs) -> None:
-        self.file.write(f"### Шаг: Рассуждение\n\n")
+        self.file.write(f"\n### ⬅️ Ответ от LLM\n\n")
         try:
-            thought = response.generations[0][0].text
+            raw_response = response.generations[0][0].text
+            self.file.write(f"**Ответ модели (raw):**\n```text\n{raw_response}\n```\n")
         except (AttributeError, IndexError):
-            thought = str(response.generations)
-        self.file.write(f"**Мысли агента:**\n```\n{thought}\n```\n")
+            self.file.write(f"**Не удалось извлечь ответ из объекта LLMResult.**\n")
+        self.file.flush()
+
+    def on_agent_action(self, action: AgentAction, **kwargs) -> None:
+        self.file.write(f"\n### 🛠️ Действие Агента\n\n")
+        self.file.write(f"**Инструмент:** `{action.tool}`\n")
+        self.file.write(f"**Входные данные (SQL):**\n```sql\n{action.tool_input}\n```\n")
+        self.file.flush()
+
+    def on_tool_end(self, output: str, **kwargs) -> None:
+        self.file.write(f"\n### 📊 Результат Инструмента\n\n")
+        self.file.write(f"**Полученные данные из БД:**\n```\n{output}\n```\n")
+        self.file.flush()
+
     def on_agent_finish(self, finish: AgentFinish, **kwargs) -> None:
-        self.file.write(f"### Шаг: Финальный ответ\n\n")
+        self.file.write(f"\n### ✅ Финальный Ответ Агента\n\n")
         self.file.write(f"**Итоговый ответ для пользователя:**\n```\n{finish.return_values.get('output')}\n```\n")
+        self.file.flush()
+
     def on_chain_end(self, outputs: dict, **kwargs) -> None:
-        self.file.write(f"\n--- Сессия завершена ---\n")
+        self.file.write(f"\n--- 🏁 Сессия завершена ---\n")
         self.file.flush()
 
 try:
