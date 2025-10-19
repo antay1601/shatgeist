@@ -5,108 +5,178 @@ import os
 import logging
 from dotenv import load_dotenv
 from datetime import datetime
+import sqlite3
+import faiss
+from sentence_transformers import SentenceTransformer
+import numpy as np
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters.command import Command
 
 from langchain_community.utilities import SQLDatabase
 from langchain_anthropic import ChatAnthropic
-from langchain_community.agent_toolkits import create_sql_agent
-from langchain_core.prompts import ChatPromptTemplate
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.prompts import PromptTemplate
+from langchain_community.tools import Tool
+from langchain.tools.render import render_text_description
 
 from langchain.callbacks.base import BaseCallbackHandler
 from langchain.schema import AgentAction, AgentFinish, LLMResult
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 load_dotenv()
 
 # --- Константы ---
 DB_FILE = 'qa.db'
+FAISS_INDEX_FILE = 'qa.index'
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-LOG_FILE = "llm_requests.log"
+DETAILED_LOG_FILE = "llm_requests.log"
+VERBOSE_LOG_FILE = "agent_verbose.md"
+MODEL_NAME_SEMANTIC = 'paraphrase-multilingual-mpnet-base-v2'
 
-if not ANTHROPIC_API_KEY or not TELEGRAM_BOT_TOKEN:
-    raise ValueError("Необходимо установить ANTHROPIC_API_KEY и TELEGRAM_BOT_TOKEN в .env файле")
+# --- 1. Ручная настройка логирования ---
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+if logger.hasHandlers():
+    logger.handlers.clear()
 
-# ... (Класс FileCallbackHandler остается без изменений) ...
-class FileCallbackHandler(BaseCallbackHandler):
-    """Логирует полный цикл работы агента, уделяя особое внимание запросам к LLM."""
-    def __init__(self, filename: str = LOG_FILE):
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(stream_handler)
+
+file_handler = logging.FileHandler(VERBOSE_LOG_FILE, mode='a', encoding='utf-8')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+
+# --- 2. Инициализация ---
+try:
+    logging.info("Инициализация компонентов...")
+    db = SQLDatabase.from_uri(f"sqlite:///{DB_FILE}")
+    llm = ChatAnthropic(model="claude-3-5-sonnet-20240620", temperature=0)
+    semantic_model = SentenceTransformer(MODEL_NAME_SEMANTIC)
+    faiss_index = faiss.read_index(FAISS_INDEX_FILE)
+    logging.info("Все компоненты успешно инициализированы.")
+except Exception as e:
+    logging.critical(f"Критическая ошибка при инициализации: {e}")
+    db = llm = semantic_model = faiss_index = None
+
+# --- 3. Инструменты ---
+async def run_smart_semantic_search(query: str) -> str:
+    try:
+        k = 5
+        logging.info(f"Запуск умного семантического поиска для запроса: '{query}'")
+        expansion_prompt = PromptTemplate.from_template(
+            "Пользователь ищет в истории чата информацию по теме: '{query}'. "
+            "Сгенеририруй 3 альтернативных поисковых запроса на русском языке. Выведи каждый с новой строки."
+        )
+        expansion_chain = expansion_prompt | llm
+        response = await expansion_chain.ainvoke({"query": query})
+        expanded_queries = [q.strip() for q in response.content.split('\n') if q.strip()]
+        search_queries = [query] + expanded_queries
+        logging.info(f"Сгенерированы расширенные запросы: {search_queries}")
+
+        query_vectors = semantic_model.encode(search_queries)
+        
+        # --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: Явно преобразуем векторы в тип float32 ---
+        all_distances, all_ids = faiss_index.search(query_vectors.astype(np.float32), k)
+        
+        unique_ids = list(dict.fromkeys(all_ids.flatten()))
+        unique_ids = [int(id_val) for id_val in unique_ids if id_val != -1]
+        if not unique_ids:
+            return "Семантический поиск не нашел релевантных сообщений."
+
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        placeholders = ','.join('?' for _ in unique_ids)
+        cursor.execute(f"SELECT author_name, timestamp, message_text FROM messages WHERE message_id IN ({placeholders})", tuple(unique_ids))
+        results = cursor.fetchall()
+        conn.close()
+
+        if not results:
+            return "Семантический поиск не нашел релевантных сообщений."
+        
+        return "\n---\n".join([f"Автор: {row[0]} ({row[1]})\nСообщение: {row[2]}" for row in results])
+    except Exception as e:
+        logging.error(f"Ошибка в run_smart_semantic_search: {e}")
+        return f"Ошибка при семантическом поиске: {e}"
+
+tools = [
+    Tool(
+        name="smart_semantic_search_chat",
+        func=run_smart_semantic_search,
+        description="""Используй для открытых, концептуальных вопросов (рекомендации, обсуждения), когда нужно найти сообщения по смыслу. Например: "посоветуйте стоматолога", "обсуждения ресторанов", "что говорили про ремонт". """,
+        coroutine=run_smart_semantic_search
+    ),
+    Tool(
+        name="sql_database_query",
+        func=db.run,
+        description="""Используй для выполнения SQL-запросов. Полезен для точных вопросов (подсчет, поиск по автору/дате). Входные данные - корректный SQLite запрос. Ты можешь использовать этот инструмент для проверки схемы БД."""
+    )
+]
+
+# --- 4. Логгеры и Промпт ---
+class DetailedFileCallbackHandler(BaseCallbackHandler):
+    def __init__(self, filename: str = DETAILED_LOG_FILE):
         self.file = open(filename, 'a', encoding='utf-8')
-
     def on_chain_start(self, serialized: dict, inputs: dict, **kwargs) -> None:
         self.file.write(f"\n\n---\n\n## 🚀 Новая сессия: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        user_input = "Не удалось определить входной запрос"
-        if isinstance(inputs, dict):
-            user_input = inputs.get('input', user_input)
-        self.file.write(f"**Входной запрос пользователя:**\n```\n{user_input}\n```\n")
+        self.file.write(f"**Входной запрос пользователя:**\n```\n{inputs.get('input', 'N/A')}\n```\n")
         self.file.flush()
-
     def on_llm_start(self, serialized: dict, prompts: list[str], **kwargs) -> None:
-        self.file.write(f"\n### ➡️ Запрос к LLM\n\n")
-        for i, prompt in enumerate(prompts):
-            self.file.write(f"**Промпт {i+1}:**\n```text\n{prompt}\n```\n")
+        self.file.write(f"\n### ➡️ Запрос к LLM (Раунд размышлений)\n\n")
+        self.file.write(f"**Полный промпт, отправленный модели:**\n```text\n{prompts}\n```\n")
         self.file.flush()
-
-    def on_llm_end(self, response: LLMResult, **kwargs) -> None:
-        self.file.write(f"\n### ⬅️ Ответ от LLM\n\n")
-        try:
-            raw_response = response.generations[0][0].text
-            self.file.write(f"**Ответ модели (raw):**\n```text\n{raw_response}\n```\n")
-        except (AttributeError, IndexError):
-            self.file.write(f"**Не удалось извлечь ответ из объекта LLMResult.**\n")
-        self.file.flush()
-
     def on_agent_action(self, action: AgentAction, **kwargs) -> None:
-        self.file.write(f"\n### 🛠️ Действие Агента\n\n")
-        self.file.write(f"**Инструмент:** `{action.tool}`\n")
-        self.file.write(f"**Входные данные (SQL):**\n```sql\n{action.tool_input}\n```\n")
+        self.file.write(f"\n### 🛠️ Выбранное Действие\n\n**Инструмент:** `{action.tool}`\n**Входные данные:**\n```\n{action.tool_input}\n```\n")
         self.file.flush()
-
     def on_tool_end(self, output: str, **kwargs) -> None:
-        self.file.write(f"\n### 📊 Результат Инструмента\n\n")
-        self.file.write(f"**Полученные данные из БД:**\n```\n{output}\n```\n")
+        self.file.write(f"\n### 📊 Результат Инструмента\n\n```\n{output}\n```\n")
         self.file.flush()
-
     def on_agent_finish(self, finish: AgentFinish, **kwargs) -> None:
-        self.file.write(f"\n### ✅ Финальный Ответ Агента\n\n")
-        self.file.write(f"**Итоговый ответ для пользователя:**\n```\n{finish.return_values.get('output')}\n```\n")
+        self.file.write(f"\n### ✅ Финальный Ответ\n\n```\n{finish.return_values.get('output')}\n```\n")
         self.file.flush()
-
     def on_chain_end(self, outputs: dict, **kwargs) -> None:
         self.file.write(f"\n--- 🏁 Сессия завершена ---\n")
         self.file.flush()
 
-try:
-    logging.info("Инициализация 'двигателя' бота...")
-    db = SQLDatabase.from_uri(f"sqlite:///{DB_FILE}")
-    llm = ChatAnthropic(model="claude-3-5-sonnet-20240620", temperature=0)
+class VerboseFileCallbackHandler(BaseCallbackHandler):
+    """Callback-обработчик, который пишет 'мысли' агента через стандартный модуль logging."""
+    def on_chain_start(self, serialized: dict, inputs: dict, **kwargs) -> None:
+        logging.info("> Entering new AgentExecutor chain...")
+    def on_agent_action(self, action: AgentAction, **kwargs) -> None:
+        logging.info(action.log.strip())
+    def on_tool_end(self, output: str, **kwargs) -> None:
+        logging.info(f"Observation: {output}")
+    def on_agent_finish(self, finish: AgentFinish, **kwargs) -> None:
+        logging.info(finish.log.strip())
+    def on_chain_end(self, outputs: dict, **kwargs) -> None:
+        logging.info("> Finished chain.")
 
-    # --- ИЗМЕНЕНИЕ: Добавляем требование цитирования ---
-    CUSTOM_PROMPT_TEMPLATE = """
-Ты — агент, созданный для взаимодействия с SQL базой данных. Твоя задача - отвечать на вопросы пользователя на РУССКОМ ЯЗЫКЕ.
-База данных, к которой ты обращаешься, — это лог чата в Telegram (Валенсия, Испания).
-Твоя основная функция — запрашивать базу данных. Ты должен в первую очередь пытаться найти ответ в ней.
-Если после выполнения SQL-запроса ты получаешь пустой результат, твой финальный ответ должен быть: "К сожалению, в истории чата не нашлось информации по вашему запросу."
-Не придумывай ответ на основе своих общих знаний, если база данных ничего не вернула.
+CUSTOM_PROMPT_TEMPLATE = """
+Твоя задача - отвечать на вопросы пользователя на РУССКОМ ЯЗЫКЕ, анализируя историю чата.
+Сначала проанализируй вопрос и выбери наиболее подходящий инструмент.
+- Для концептуальных вопросов (рекомендации, обсуждения) используй `smart_semantic_search_chat`.
+- Для точных вопросов (статистика, поиск по автору/дате) используй `sql_database_query`.
+Перед использованием `sql_database_query`, ты МОЖЕШЬ проверить схему таблицы, если не уверен в именах колонок.
 
-**ВАЖНОЕ ПРАВИЛО ФОРМАТИРОВАНИЯ ОТВЕТА:**
-Твой финальный ответ должен состоять из двух частей:
-1.  **Сводка:** Краткий, лаконичный вывод на русском языке.
-2.  **Источники:** Под заголовком "**Исходные сообщения:**" приведи 2-3 наиболее релевантных сообщения из базы данных, на основе которых сделана сводка. Каждое сообщение должно быть отформатировано так: `Автор (Дата): Текст сообщения`.
+**Схема базы данных:**
+{db_schema}
 
 У тебя есть доступ к следующим инструментам:
 {tools}
 
-Используй СТРОГО следующий формат:
+**ВАЖНОЕ ПРАВИЛО ФОРМАТИРОВАНИЯ ОТВЕТА:**
+Твой финальный ответ должен состоять из двух частей:
+1.  **Сводка:** Краткий, лаконичный вывод на русском языке.
+2.  **Источники:** Под загоголовком "**Исходные сообщения:**" приведи 2-3 наиболее релевантных сообщения из базы данных, на основе которых сделана сводка. Каждое сообщение должно быть отформатировано так: `Автор (Дата): Текст сообщения`.
 
+Используй СТРОГО следующий формат для своих мыслей:
 Question: the input question you must answer
-Thought: твои рассуждения о том, что делать дальше, на русском языке.
+Thought: твои рассуждения на русском языке о том, какой инструмент выбрать и почему.
 Action: the action to take, should be one of [{tool_names}]
 Action Input: the input to the action
 Observation: the result of the action
-... (Эта последовательность Thought/Action/Action Input/Observation может повторяться N раз)
+... (Эта последовательность может повторяться)
 Thought: Теперь я знаю финальный ответ и сформулирую его на русском языке, следуя правилу форматирования.
 Final Answer: финальный ответ, состоящий из сводки и источников.
 
@@ -115,62 +185,50 @@ Final Answer: финальный ответ, состоящий из сводк�
 Question: {input}
 Thought:{agent_scratchpad}
 """
-    
-    prompt = ChatPromptTemplate.from_template(CUSTOM_PROMPT_TEMPLATE)
-    agent_executor = create_sql_agent(
-        llm=llm,
-        db=db,
-        prompt=prompt,
-        verbose=True,
-        handle_parsing_errors=True
-    )
 
-    logging.info("'Двигатель' бота (SQL-агент с Claude и гибридным промптом) успешно инициализирован.")
+try:
+    rendered_tools = render_text_description(tools)
+    tool_names = ", ".join([t.name for t in tools])
+    db_schema = db.get_table_info()
+    prompt = PromptTemplate.from_template(CUSTOM_PROMPT_TEMPLATE).partial(
+        tools=rendered_tools,
+        tool_names=tool_names,
+        db_schema=db_schema
+    )
+    agent = create_react_agent(llm, tools, prompt)
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=False, handle_parsing_errors=True)
+    logging.info("'Двигатель' бота (Гибридный агент) успешно инициализирован.")
 except Exception as e:
-    logging.critical(f"Не удалось инициализировать SQL-агента! Ошибка: {e}")
+    logging.critical(f"Не удалось инициализировать гибридного агента! Ошибка: {e}")
     agent_executor = None
 
+# --- 5. Логика Telegram-бота ---
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def send_welcome(message: types.Message):
-    await message.answer(
-        "Привет! Я — ChatGeist, аналитик истории этого чата.\n"
-        "Задайте мне вопрос, и я постараюсь найти ответ в базе данных сообщений.\n\n"
-        "Например: 'Кто самый активный участник?' или 'Покажи последние 5 сообщений от Ивана'."
-    )
+    await message.answer("Привет! Я — ChatGeist, гибридный аналитик истории этого чата. Задайте мне вопрос.")
 
 @dp.message()
 async def handle_message(message: types.Message):
     if not agent_executor:
-        await message.answer("Извините, аналитический модуль не запущен из-за ошибки. Проверьте логи сервера.")
+        await message.answer("Извините, аналитический модуль не запущен.")
         return
-    if not message.text:
-        return
+    if not message.text: return
 
     thinking_message = await message.answer("Анализирую ваш запрос...")
-
     try:
-        file_logger = FileCallbackHandler()
+        detailed_logger = DetailedFileCallbackHandler()
+        verbose_logger = VerboseFileCallbackHandler()
         response = await agent_executor.ainvoke(
             {"input": message.text},
-            {"callbacks": [file_logger]}
+            {"callbacks": [detailed_logger, verbose_logger]}
         )
         final_answer = response.get('output', "Не удалось извлечь ответ.")
-
     except Exception as e:
-        # ... (обработка ошибок остается прежней)
         logging.error(f"Ошибка при выполнении запроса агентом: {e}")
-        error_text = str(e)
-        if "Could not parse LLM output:" in error_text:
-            logging.warning("Произошла ошибка парсинга, извлекаю ответ из текста ошибки...")
-            raw_answer = error_text.split("Could not parse LLM output:")[1]
-            final_answer = raw_answer.split("For troubleshooting, visit:")[0].strip()
-        elif "quota" in error_text.lower() or "limit" in error_text.lower():
-            final_answer = "К сожалению, я сейчас перегружен запросами (превышен лимит API). Пожалуйста, повторите попытку позже."
-        else:
-            final_answer = "К сожалению, при обработке вашего запроса произошла серьезная ошибка."
+        final_answer = "К сожалению, при обработке вашего запроса произошла ошибка."
 
     await thinking_message.edit_text(final_answer)
 
@@ -178,10 +236,8 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
-    if agent_executor is None:
-        logging.critical("Запуск бота отменен, так как аналитический модуль не был инициализирован.")
-    else:
+    if all([db, llm, semantic_model, faiss_index, agent_executor]):
         logging.info("Запуск Telegram-бота...")
         asyncio.run(main())
-
-# --- END OF FILE main.py ---
+    else:
+        logging.critical("Запуск бота отменен.")
